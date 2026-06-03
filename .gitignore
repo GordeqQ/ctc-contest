@@ -7,3 +7,5 @@ checkpoints
 runs/*/*.pt
 runs/*/*.log
 runs/*/submission*.csv
+weights/submission.csv
+weights/submission_*.csv

@@ -1,5 +1,6 @@
 import argparse
 import csv
+import math
 import random
 import wave
 from pathlib import Path
@@ -21,13 +22,11 @@ def read_csv(path):
         return list(csv.DictReader(file))
 
 
-def read_submission_rows(sample_submission, test_dir):
-    if sample_submission.exists():
-        return read_csv(sample_submission)
+def read_test_rows(test_dir):
     files = sorted(Path(test_dir).glob("*.wav"))
     if not files:
-        raise FileNotFoundError(f"No sample submission and no test wavs in {test_dir}")
-    print(f"sample submission not found, using {len(files)} test wav files")
+        raise FileNotFoundError()
+    print(f"using {len(files)} test wav files")
     return [{"filename": path.name, "text": ""} for path in files]
 
 
@@ -115,6 +114,7 @@ class MorseCTC(nn.Module):
         packed = pack_padded_sequence(x, lengths.cpu(), batch_first=True, enforce_sorted=False)
         packed, _ = self.rnn(packed)
         x, _ = pad_packed_sequence(packed, batch_first=True)
+
         return self.classifier(x).log_softmax(dim=-1).transpose(0, 1), lengths
 
 
@@ -131,6 +131,72 @@ def decode(log_probs, lengths):
             previous = token
         answers.append("".join(text))
     return answers
+
+
+def logsumexp_pair(left, right):
+    if left == -math.inf:
+        return right
+
+    if right == -math.inf:
+        return left
+
+    if left < right:
+        left, right = right, left
+
+    return left + math.log1p(math.exp(right - left))
+
+
+def ctc_beam_decode_one(sequence, beam_size):
+    beams = {"": (0.0, -math.inf)}
+
+    for frame in sequence:
+        next_beams = {}
+        top_ids = torch.topk(frame, k=min(beam_size, frame.numel())).indices.tolist()
+        for prefix, (blank_score, nonblank_score) in beams.items():
+            total_score = logsumexp_pair(blank_score, nonblank_score)
+            for token in top_ids:
+                score = float(frame[token])
+                if token == BLANK:
+                    old_blank, old_nonblank = next_beams.get(prefix, (-math.inf, -math.inf))
+                    old_blank = logsumexp_pair(old_blank, total_score + score)
+                    next_beams[prefix] = (old_blank, old_nonblank)
+                    continue
+
+                char = id_to_char[token]
+                if prefix and char == prefix[-1]:
+                    old_blank, old_nonblank = next_beams.get(prefix, (-math.inf, -math.inf))
+                    old_nonblank = logsumexp_pair(old_nonblank, nonblank_score + score)
+                    next_beams[prefix] = (old_blank, old_nonblank)
+
+                    extended = prefix + char
+                    old_blank, old_nonblank = next_beams.get(extended, (-math.inf, -math.inf))
+                    old_nonblank = logsumexp_pair(old_nonblank, blank_score + score)
+                    next_beams[extended] = (old_blank, old_nonblank)
+
+                else:
+                    extended = prefix + char
+                    old_blank, old_nonblank = next_beams.get(extended, (-math.inf, -math.inf))
+                    old_nonblank = logsumexp_pair(old_nonblank, total_score + score)
+                    next_beams[extended] = (old_blank, old_nonblank)
+
+        beams = dict(
+            sorted(
+                next_beams.items(),
+                key=lambda item: logsumexp_pair(item[1][0], item[1][1]),
+                reverse=True,)[:beam_size])
+
+    return max(beams.items(), key=lambda item: logsumexp_pair(item[1][0], item[1][1]))[0]
+
+
+def beam_decode(log_probs, lengths, beam_size):
+    batch = log_probs.transpose(0, 1).cpu()
+    return [ctc_beam_decode_one(batch[index, : int(length)], beam_size) for index, length in enumerate(lengths)]
+
+
+def decode_batch(log_probs, lengths, beam_size):
+    if beam_size <= 1:
+        return decode(log_probs, lengths)
+    return beam_decode(log_probs, lengths, beam_size)
 
 
 def levenshtein(left, right):
@@ -236,20 +302,24 @@ def train(args, device):
     metrics_path = prepare_run(args, device)
     train_loader, val_loader = make_loaders(args)
     model = MorseCTC().to(device)
+
     optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=1e-4)
     loss_fn = nn.CTCLoss(blank=BLANK, zero_infinity=True)
     last_path = args.checkpoint_dir / "last.pt"
     best_path = args.checkpoint_dir / "best.pt"
     start_epoch = 0
     best_score = float("inf")
+
     if last_path.exists() and not args.fresh:
         checkpoint = load_state(last_path, model, optimizer, device)
         start_epoch = checkpoint["epoch"]
         best_score = checkpoint["score"]
         print(f"resume={last_path} completed_epochs={start_epoch} best_val={best_score:.4f}")
+
     for epoch in range(start_epoch + 1, args.epochs + 1):
         model.train()
         total_loss = 0.0
+
         for step, (specs, input_lengths, targets, target_lengths, _) in enumerate(train_loader, start=1):
             specs = specs.to(device, non_blocking=True)
             targets = targets.to(device, non_blocking=True)
@@ -262,16 +332,21 @@ def train(args, device):
             total_loss += float(loss.detach())
             if step % args.log_every == 0:
                 print(f"epoch={epoch} step={step}/{len(train_loader)} loss={total_loss / step:.4f}")
+
         train_loss = total_loss / len(train_loader)
         score, examples = validate(model, val_loader, device)
+
         print(f"epoch={epoch} train_loss={train_loss:.4f} val_levenshtein={score:.4f}")
         print("examples:", examples)
+
         if score < best_score:
             best_score = score
             save_state(best_path, model, optimizer, epoch, best_score)
             print(f"saved={best_path}")
+
         save_state(last_path, model, optimizer, epoch, best_score)
         append_metrics(metrics_path, epoch, train_loss, score, best_score)
+
     return best_path
 
 
@@ -280,8 +355,9 @@ def predict(args, device):
     best_path = args.checkpoint_dir / "best.pt"
     submission_path = args.submission or args.checkpoint_dir / "submission.csv"
     if not best_path.exists():
-        raise FileNotFoundError(f"No checkpoint: {best_path}. Run --mode train first.")
-    rows = read_submission_rows(args.sample_submission, args.data_dir / "test")
+        raise FileNotFoundError()
+
+    rows = read_test_rows(args.data_dir / "test")
     dataset = MorseDataset([{"filename": row["filename"]} for row in rows], args.data_dir / "test")
     loader = DataLoader(
         dataset,
@@ -291,15 +367,18 @@ def predict(args, device):
         collate_fn=collate,
         pin_memory=torch.cuda.is_available(),
     )
+
     model = MorseCTC().to(device)
     checkpoint = load_state(best_path, model, device=device)
+
     if checkpoint.get("chars") != CHARS:
         raise ValueError()
+
     model.eval()
     predictions = []
     for step, (specs, input_lengths, _, _, _) in enumerate(loader, start=1):
         log_probs, output_lengths = model(specs.to(device, non_blocking=True), input_lengths)
-        predictions.extend(decode(log_probs, output_lengths))
+        predictions.extend(decode_batch(log_probs, output_lengths, args.beam_size))
         if step % args.log_every == 0:
             print(f"predict step={step}/{len(loader)}")
     with open(submission_path, "w", newline="", encoding="utf-8") as file:
@@ -307,6 +386,7 @@ def predict(args, device):
         writer.writeheader()
         for row, text in zip(rows, predictions):
             writer.writerow({"filename": row["filename"], "text": text})
+
     print(f"saved={submission_path} rows={len(predictions)}")
 
 
@@ -314,10 +394,9 @@ def parse_args():
     parser = argparse.ArgumentParser()
     parser.add_argument("--mode", choices=["all", "train", "predict"], default="all")
     parser.add_argument("--data-dir", type=Path, default=Path("morse_dataset"))
-    parser.add_argument("--sample-submission", type=Path, default=Path("sample_submission.csv"))
     parser.add_argument("--submission", type=Path)
     parser.add_argument("--checkpoint-dir", type=Path, default=Path("checkpoints"))
-    parser.add_argument("--epochs", type=int, default=12)
+    parser.add_argument("--epochs", type=int, default=20)
     parser.add_argument("--batch-size", type=int, default=64)
     parser.add_argument("--predict-batch-size", type=int, default=16)
     parser.add_argument("--workers", type=int, default=0)
@@ -325,6 +404,7 @@ def parse_args():
     parser.add_argument("--val-fraction", type=float, default=0.1)
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--log-every", type=int, default=50)
+    parser.add_argument("--beam-size", type=int, default=1)
     parser.add_argument("--fresh", action="store_true")
     return parser.parse_args()
 
@@ -332,17 +412,23 @@ def parse_args():
 def run(args):
     random.seed(args.seed)
     torch.manual_seed(args.seed)
+
     if torch.cuda.is_available():
         torch.cuda.manual_seed_all(args.seed)
+
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"device={device}")
+
     if args.mode == "train":
         train(args, device)
+
     elif args.mode == "predict":
         predict(args, device)
+
     elif (args.checkpoint_dir / "best.pt").exists() and not args.fresh:
-        print("best checkpoint already exists, skip training")
+        print("используй уже существующие лучшие веса ")
         predict(args, device)
+
     else:
         train(args, device)
         predict(args, device)
