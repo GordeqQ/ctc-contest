@@ -329,8 +329,7 @@ def parse_args():
     return parser.parse_args()
 
 
-def main():
-    args = parse_args()
+def run(args):
     random.seed(args.seed)
     torch.manual_seed(args.seed)
     if torch.cuda.is_available():
@@ -347,6 +346,10 @@ def main():
     else:
         train(args, device)
         predict(args, device)
+
+
+def main():
+    run(parse_args())
 
 
 if __name__ == "__main__":
