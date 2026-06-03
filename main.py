@@ -21,6 +21,16 @@ def read_csv(path):
         return list(csv.DictReader(file))
 
 
+def read_submission_rows(sample_submission, test_dir):
+    if sample_submission.exists():
+        return read_csv(sample_submission)
+    files = sorted(Path(test_dir).glob("*.wav"))
+    if not files:
+        raise FileNotFoundError(f"No sample submission and no test wavs in {test_dir}")
+    print(f"sample submission not found, using {len(files)} test wav files")
+    return [{"filename": path.name, "text": ""} for path in files]
+
+
 def read_wav(path):
     with wave.open(str(path), "rb") as file:
         if file.getframerate() != 8000 or file.getnchannels() != 1 or file.getsampwidth() != 2:
@@ -49,15 +59,9 @@ class MorseDataset(Dataset):
             if random.random() < 0.5:
                 wav = wav + torch.randn_like(wav) * random.uniform(0.0, 0.012)
 
-        spec = torch.stft(
-            wav,
-            n_fft=256,
-            hop_length=80,
-            win_length=256,
-            window=self.window,
-            center=False,
-            return_complex=True,
-        ).abs()
+        spec = torch.stft(wav, n_fft=256, hop_length=80,
+                          win_length=256, window=self.window, center=False,
+                          return_complex=True, ).abs()
 
         spec = torch.log1p(spec).transpose(0, 1)
         spec = (spec - spec.mean()) / (spec.std() + 1e-5)
@@ -88,6 +92,7 @@ def collate(batch):
 class MorseCTC(nn.Module):
     def __init__(self):
         super().__init__()
+        hidden_size = 256
         self.conv = nn.Sequential(
             nn.Conv1d(129, 192, kernel_size=5, stride=2, padding=2),
             nn.BatchNorm1d(192),
@@ -97,15 +102,11 @@ class MorseCTC(nn.Module):
             nn.ReLU(),
         )
 
-        self.rnn = nn.GRU(
-            input_size=192,
-            hidden_size=192,
-            num_layers=2,
-            dropout=0.2,
-            bidirectional=True,
-            batch_first=True,
-        )
-        self.classifier = nn.Linear(384, len(CHARS) + 1)
+        self.rnn = nn.GRU(input_size=192, hidden_size=hidden_size, num_layers=3,
+                          dropout=0.2, bidirectional=True,
+                          batch_first=True, )
+
+        self.classifier = nn.Linear(hidden_size * 2, len(CHARS) + 1)
 
     def forward(self, specs, lengths):
         x = self.conv(specs.transpose(1, 2)).transpose(1, 2)
@@ -170,6 +171,32 @@ def save_state(path, model, optimizer, epoch, score):
     )
 
 
+def prepare_run(args, device):
+    args.checkpoint_dir.mkdir(parents=True, exist_ok=True)
+    config = {
+        "device": device,
+        "torch": torch.__version__,
+        "batch_size": args.batch_size,
+        "epochs": args.epochs,
+        "lr": args.lr,
+        "val_fraction": args.val_fraction,
+        "seed": args.seed,
+    }
+    with open(args.checkpoint_dir / "config.txt", "w", encoding="utf-8") as file:
+        for key, value in config.items():
+            file.write(f"{key}={value}\n")
+    metrics_path = args.checkpoint_dir / "metrics.csv"
+    if not metrics_path.exists():
+        with open(metrics_path, "w", newline="", encoding="utf-8") as file:
+            csv.writer(file).writerow(["epoch", "train_loss", "val_levenshtein", "best_val"])
+    return metrics_path
+
+
+def append_metrics(path, epoch, train_loss, score, best_score):
+    with open(path, "a", newline="", encoding="utf-8") as file:
+        csv.writer(file).writerow([epoch, f"{train_loss:.6f}", f"{score:.6f}", f"{best_score:.6f}"])
+
+
 @torch.inference_mode()
 def validate(model, loader, device):
     model.eval()
@@ -206,6 +233,7 @@ def make_loaders(args):
 
 
 def train(args, device):
+    metrics_path = prepare_run(args, device)
     train_loader, val_loader = make_loaders(args)
     model = MorseCTC().to(device)
     optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=1e-4)
@@ -234,23 +262,26 @@ def train(args, device):
             total_loss += float(loss.detach())
             if step % args.log_every == 0:
                 print(f"epoch={epoch} step={step}/{len(train_loader)} loss={total_loss / step:.4f}")
+        train_loss = total_loss / len(train_loader)
         score, examples = validate(model, val_loader, device)
-        print(f"epoch={epoch} train_loss={total_loss / len(train_loader):.4f} val_levenshtein={score:.4f}")
+        print(f"epoch={epoch} train_loss={train_loss:.4f} val_levenshtein={score:.4f}")
         print("examples:", examples)
         if score < best_score:
             best_score = score
             save_state(best_path, model, optimizer, epoch, best_score)
             print(f"saved={best_path}")
         save_state(last_path, model, optimizer, epoch, best_score)
+        append_metrics(metrics_path, epoch, train_loss, score, best_score)
     return best_path
 
 
 @torch.inference_mode()
 def predict(args, device):
     best_path = args.checkpoint_dir / "best.pt"
+    submission_path = args.submission or args.checkpoint_dir / "submission.csv"
     if not best_path.exists():
         raise FileNotFoundError(f"No checkpoint: {best_path}. Run --mode train first.")
-    rows = read_csv(args.sample_submission)
+    rows = read_submission_rows(args.sample_submission, args.data_dir / "test")
     dataset = MorseDataset([{"filename": row["filename"]} for row in rows], args.data_dir / "test")
     loader = DataLoader(
         dataset,
@@ -271,12 +302,12 @@ def predict(args, device):
         predictions.extend(decode(log_probs, output_lengths))
         if step % args.log_every == 0:
             print(f"predict step={step}/{len(loader)}")
-    with open(args.submission, "w", newline="", encoding="utf-8") as file:
+    with open(submission_path, "w", newline="", encoding="utf-8") as file:
         writer = csv.DictWriter(file, fieldnames=["filename", "text"])
         writer.writeheader()
         for row, text in zip(rows, predictions):
             writer.writerow({"filename": row["filename"], "text": text})
-    print(f"saved={args.submission} rows={len(predictions)}")
+    print(f"saved={submission_path} rows={len(predictions)}")
 
 
 def parse_args():
@@ -284,7 +315,7 @@ def parse_args():
     parser.add_argument("--mode", choices=["all", "train", "predict"], default="all")
     parser.add_argument("--data-dir", type=Path, default=Path("morse_dataset"))
     parser.add_argument("--sample-submission", type=Path, default=Path("sample_submission.csv"))
-    parser.add_argument("--submission", type=Path, default=Path("submission.csv"))
+    parser.add_argument("--submission", type=Path)
     parser.add_argument("--checkpoint-dir", type=Path, default=Path("checkpoints"))
     parser.add_argument("--epochs", type=int, default=12)
     parser.add_argument("--batch-size", type=int, default=64)
