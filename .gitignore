@@ -1,5 +1,7 @@
 .venv
 .env
+.idea
+__pycache__
 morse_dataset
 checkpoints
 runs/*/*.pt
