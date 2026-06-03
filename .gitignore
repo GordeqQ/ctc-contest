@@ -1,0 +1,7 @@
+.venv
+.env
+morse_dataset
+checkpoints
+runs/*/*.pt
+runs/*/*.log
+runs/*/submission*.csv
